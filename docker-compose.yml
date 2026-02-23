@@ -1,6 +1,7 @@
 services:
   db:
     image: postgis/postgis:13-3.3
+    platform: linux/amd64
     shm_size: 1g
     env_file:
       - ./dev.env
@@ -17,6 +18,7 @@ services:
 
   adminer:
     image: adminer
+    platform: linux/amd64
     ports:
       - 8080:8080
     depends_on:
@@ -34,6 +36,7 @@ services:
 
   redis-commander:
     container_name: redis-commander
+    platform: linux/amd64
     hostname: redis-commander
     image: rediscommander/redis-commander:latest
     restart: always
@@ -46,6 +49,7 @@ services:
 
   celery-workflow:
     image: 'materialize:tag'
+    platform: linux/amd64
     env_file:
       - ./dev.env
     environment:
@@ -60,6 +64,7 @@ services:
 
   celery-process:
     image: 'materialize:tag'
+    platform: linux/amd64
     env_file:
       - ./dev.env
     environment:
@@ -74,6 +79,7 @@ services:
 
   celery-beat:
     image: 'materialize:tag'
+    platform: linux/amd64
     env_file:
       - ./dev.env
     command: celery --app=run.celery beat --pidfile=/home/nginx/celerybeat.pid
@@ -83,8 +89,21 @@ services:
     depends_on:
       - redis-master
 
+  celery-orchestration:
+    image: 'materialize:tag'
+    platform: linux/amd64
+    env_file:
+      - ./dev.env
+    command: celery --app=run.celery worker --pool=prefork --hostname=worker.orchestration@%h --queues=orchestration --concurrency=1 --loglevel=INFO -Ofair
+    volumes:
+      - ~/.cloudvolume/secrets:/home/nginx/.cloudvolume/secrets:z
+      - ~/.cloudvolume/secrets/google-secret.json:/home/nginx/.cloudvolume/secrets/google-secret.json:z
+    depends_on:
+      - redis-master    
+
   materialize:
     image: 'materialize:tag'
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
