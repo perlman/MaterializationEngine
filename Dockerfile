@@ -52,3 +52,8 @@ RUN chmod +x /entrypoint.sh
 WORKDIR /app
 
 COPY . /app
+
+# Not sure why uwsgi is using --ini /etc/uwsgi/uwsgi.ini
+# Test overriding that ini file instead of using the right one..
+
+COPY uwsgi.ini /etc/uwsgi/uwsgi.ini
