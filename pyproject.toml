@@ -16,7 +16,7 @@ dependencies = [
     "cloud-files>=4.6.1",
     "pandas",
     "flask>=2.0.2,<3.0",
-    "SQLAlchemy<1.4",
+    "SQLAlchemy>=1.4,<2",
     "flask-sqlalchemy",
     "jsonschema",
     "multiwrapper",
