@@ -1,7 +1,10 @@
 import datetime
 import logging
 import os
+import signal
 import sys
+import threading
+import time
 import warnings
 from typing import Any, Callable, Dict
 
@@ -101,8 +104,102 @@ def create_celery(app=None):
     celery.Task = ContextTask
     if os.environ.get("SLACK_WEBHOOK"):
         celery.Task.on_failure = post_to_slack_on_task_failure
-    
+
+    configure_worker_autoshutdown(app)
+
     return celery
+
+
+def configure_worker_autoshutdown(app):
+    """Let a worker exit after a bounded amount of work so it behaves correctly
+    as a KEDA ScaledJob pod (one pod -> a little work -> exit), instead of
+    running forever like a normal long-lived worker.
+
+    Config (written by the helm chart into the orchestration config.cfg; absent
+    -> feature disabled, so ordinary workers such as producer/consumer/api are
+    unaffected):
+
+      CELERY_WORKER_AUTOSHUTDOWN_ENABLED        master on/off switch
+      CELERY_WORKER_AUTOSHUTDOWN_MAX_TASKS      exit after this many completed tasks
+      CELERY_WORKER_AUTOSHUTDOWN_DELAY_SECONDS  grace period after the last task before
+                                                exiting (lets acks / result writes settle)
+      CELERY_WORKER_IDLE_TIMEOUT_SECONDS        if > 0, exit when no task has started for
+                                                this long -- covers "started but the queue
+                                                was empty". Set small for a near-immediate
+                                                exit on an empty queue (0 = disabled).
+
+    Deliberately task-agnostic (counts any task) so it can be reused on any queue.
+    """
+    if not app.config.get("CELERY_WORKER_AUTOSHUTDOWN_ENABLED", False):
+        return
+
+    from celery.signals import task_postrun, task_prerun, worker_ready
+
+    max_tasks = int(app.config.get("CELERY_WORKER_AUTOSHUTDOWN_MAX_TASKS", 1))
+    shutdown_delay = int(app.config.get("CELERY_WORKER_AUTOSHUTDOWN_DELAY_SECONDS", 2))
+    idle_timeout = int(app.config.get("CELERY_WORKER_IDLE_TIMEOUT_SECONDS", 0))
+
+    state = {"completed": 0, "idle_timer": None, "shutting_down": False}
+    lock = threading.Lock()
+
+    def _shutdown(reason, delay):
+        with lock:
+            if state["shutting_down"]:
+                return
+            state["shutting_down"] = True
+            if state["idle_timer"] is not None:
+                state["idle_timer"].cancel()
+                state["idle_timer"] = None
+        celery_logger.info(f"[autoshutdown] {reason}; exiting in {delay}s")
+
+        def _send_term():
+            if delay > 0:
+                time.sleep(delay)
+            # Warm-shutdown THIS worker only (finish any in-flight task, stop
+            # consuming, exit). Do NOT use app.control.shutdown(): that broadcasts
+            # to every worker on the queue and would kill sibling pods too.
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_send_term, name="autoshutdown", daemon=True).start()
+
+    def _arm_idle_timer():
+        if idle_timeout <= 0:
+            return
+        with lock:
+            if state["shutting_down"]:
+                return
+            if state["idle_timer"] is not None:
+                state["idle_timer"].cancel()
+            timer = threading.Timer(
+                idle_timeout, _shutdown, args=(f"no task started for {idle_timeout}s", 0)
+            )
+            timer.daemon = True
+            state["idle_timer"] = timer
+            timer.start()
+
+    @worker_ready.connect(weak=False)
+    def _on_worker_ready(**_kwargs):
+        # If the queue was empty at startup (or nothing arrives), exit rather
+        # than linger. A task arriving cancels this via task_prerun.
+        _arm_idle_timer()
+
+    @task_prerun.connect(weak=False)
+    def _on_task_prerun(**_kwargs):
+        with lock:
+            if state["idle_timer"] is not None:
+                state["idle_timer"].cancel()
+                state["idle_timer"] = None
+
+    @task_postrun.connect(weak=False)
+    def _on_task_postrun(**_kwargs):
+        with lock:
+            state["completed"] += 1
+            completed = state["completed"]
+        if completed >= max_tasks:
+            _shutdown(f"completed {completed}/{max_tasks} task(s)", shutdown_delay)
+        else:
+            # More tasks allowed on this pod; wait for the next, but don't linger.
+            _arm_idle_timer()
 
 
 @after_setup_logger.connect

@@ -23,7 +23,7 @@ from materializationengine.workflows.ingest_new_annotations import (
     ingest_new_annotations_workflow,
     find_missing_root_ids_workflow
 )
-from materializationengine.task import LockedTask
+from materializationengine.task import LockedTask, RedisLease
 from materializationengine.workflows.update_root_ids import (
     update_root_ids_workflow,
 )
@@ -54,6 +54,37 @@ def run_complete_workflow(
         datastack_info (dict): [description]
         days_to_expire (int, optional): [description]. Defaults to 5.
     """
+    # Guard the *execution* against duplicates for this datastack. The task is
+    # acks_late=False and blocks in monitor_workflow_state for the whole workflow
+    # (hours); broker redeliveries (and any duplicate enqueue) re-run the SAME
+    # message on fresh KEDA orchestration pods, so without this every duplicate
+    # would create another database version and update root ids concurrently --
+    # which corrupts the copy. A heartbeat-refreshed lease keyed by datastack
+    # lets one run proceed and turns every concurrent duplicate into a no-op.
+    datastack = datastack_info["datastack"]
+    lease = RedisLease(f"RUN_COMPLETE_WORKFLOW_LOCK:{datastack}")
+    if not lease.acquire():
+        celery_logger.warning(
+            f"run_complete_workflow for {datastack} is already running "
+            f"(lease held by {lease.holder!r}); skipping duplicate execution "
+            f"{self.request.id}."
+        )
+        return False
+    try:
+        return _run_complete_workflow(
+            self, datastack_info, days_to_expire, merge_tables, **kwargs
+        )
+    finally:
+        lease.release()
+
+
+def _run_complete_workflow(
+    self,
+    datastack_info: dict,
+    days_to_expire: int = 5,
+    merge_tables: bool = True,
+    **kwargs,
+):
     materialization_time_stamp = datetime.datetime.utcnow()
 
     new_version_number = create_new_version(

@@ -1,4 +1,5 @@
 import json
+import threading
 from hashlib import md5
 
 import redis
@@ -146,3 +147,82 @@ class LockedTask(Task):
 
     def on_success(self, retval, task_id, args, kwargs):
         self.release_lock(task_args=args, task_kwargs=kwargs)
+
+
+# Lua: refresh TTL only if we still own the lease (avoids extending a lease that
+# expired and was re-acquired by another run).
+_LEASE_REFRESH_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end"
+)
+# Lua: delete only if we still own the lease (owner-checked release).
+_LEASE_RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
+class RedisLease:
+    """A heartbeat-refreshed Redis lock that guards a long-running task's
+    *execution* -- unlike :class:`LockedTask`, which locks at ``apply_async``
+    (enqueue) time and so cannot stop a broker *redelivery* that re-runs the same
+    message without re-enqueuing.
+
+    Acquire once at the top of a task; a daemon thread refreshes the TTL every
+    ``refresh_interval`` seconds while the task runs, so an arbitrarily long
+    workflow stays locked. If the pod dies uncontrolled (SIGKILL, node loss) the
+    heartbeat stops and the lease self-expires within ~``lease_ttl`` seconds, so
+    a legitimate future run isn't blocked for long. Ownership is tracked by a
+    per-execution token, so even a same-``task_id`` redelivery running
+    concurrently is excluded (it does not own the token).
+
+    Example
+    -------
+    >>> lease = RedisLease(f"RUN_COMPLETE_WORKFLOW_LOCK:{datastack}")
+    >>> if not lease.acquire():
+    ...     return False  # another run holds it -> skip this duplicate
+    >>> try:
+    ...     do_work()
+    ... finally:
+    ...     lease.release()
+    """
+
+    def __init__(self, key: str, lease_ttl: int = 600, refresh_interval: int = 120):
+        self.key = key
+        self.token = uuid()
+        self.lease_ttl = int(lease_ttl)
+        self.refresh_interval = int(refresh_interval)
+        self._stop = threading.Event()
+        self._thread = None
+
+    def acquire(self) -> bool:
+        acquired = REDIS_CLIENT.set(self.key, self.token, nx=True, ex=self.lease_ttl)
+        if acquired:
+            self._thread = threading.Thread(
+                target=self._heartbeat, name=f"redis-lease-{self.key}", daemon=True
+            )
+            self._thread.start()
+        return bool(acquired)
+
+    def _heartbeat(self):
+        refresh = REDIS_CLIENT.register_script(_LEASE_REFRESH_LUA)
+        while not self._stop.wait(self.refresh_interval):
+            try:
+                refresh(keys=[self.key], args=[self.token, self.lease_ttl * 1000])
+            except Exception as e:  # never let a transient redis error kill the task
+                celery_logger.warning(f"RedisLease heartbeat failed for {self.key}: {e}")
+
+    def release(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        try:
+            REDIS_CLIENT.register_script(_LEASE_RELEASE_LUA)(
+                keys=[self.key], args=[self.token]
+            )
+        except Exception as e:
+            celery_logger.warning(f"RedisLease release failed for {self.key}: {e}")
+
+    @property
+    def holder(self):
+        return REDIS_CLIENT.get(self.key)

@@ -10,17 +10,42 @@ from materializationengine.blueprints.materialize.api import get_datastack_info
 from materializationengine.celery_init import celery
 from materializationengine.database import db_manager
 from dynamicannotationdb.models import AnalysisVersion
-from materializationengine.shared_tasks import check_if_task_is_running
+from materializationengine.task import REDIS_CLIENT, argument_signature
 from materializationengine.utils import get_config_param
 from materializationengine.workflows.complete_workflow import run_complete_workflow
 
 celery_logger = get_task_logger(__name__)
 
 
-def process_datastack(datastack, days_to_expire, merge_tables):
+def update_database_workflow_locked(datastack: str, datastack_info: dict) -> bool:
+    """Return True if an update_database_workflow for this datastack is already
+    queued or running.
+
+    This checks the Redis lock that ``LockedTask`` sets at *enqueue* time (see
+    ``materializationengine.task``), not live worker state. That matters under
+    KEDA scale-to-zero: the lock is present the moment the workflow is queued,
+    so we detect it even while the worker pod is still cold-starting and before
+    any task shows up in ``celery.control.inspect().active()``.
+
+    Note: this reconstructs the lock id for the *periodic* enqueue path
+    (``run_periodic_database_update``, which passes ``kwargs={"Datastack": ...}``).
+    An update triggered manually via the admin API mutates ``datastack_info``
+    before enqueuing and therefore locks under a different id; that path is not
+    detected here.
+    """
+    from materializationengine.workflows.update_database_workflow import (
+        update_database_workflow,
+    )
+
+    lock_id = argument_signature(
+        update_database_workflow.name, [datastack_info], {"Datastack": datastack}
+    )
+    return REDIS_CLIENT.get(lock_id) is not None
+
+
+def process_datastack(datastack, datastack_info, days_to_expire, merge_tables):
     celery_logger.info(f"Start periodic materialization job for {datastack}")
 
-    datastack_info = get_datastack_info(datastack)
     aligned_volume = datastack_info["aligned_volume"]["name"]
 
     with db_manager.session_scope(aligned_volume) as session:
@@ -57,12 +82,6 @@ def run_periodic_materialization(
     4. Merge annotation and segmentation tables together
     5. Drop non-materialized tables
     """
-    is_update_roots_running = check_if_task_is_running(
-        "workflow:update_database_workflow", "worker.workflow"
-    )
-    if is_update_roots_running:
-        return "Update Roots Workflow is running, delaying materialization until update roots is complete."
-
     if datastack:
         datastacks = [datastack]
 
@@ -74,7 +93,16 @@ def run_periodic_materialization(
 
     for datastack in datastacks:
         try:
-            is_running = process_datastack(datastack, days_to_expire, merge_tables)
+            datastack_info = get_datastack_info(datastack)
+            if update_database_workflow_locked(datastack, datastack_info):
+                celery_logger.error(
+                    f"Update roots workflow is queued or running for {datastack}; "
+                    "delaying materialization until it completes."
+                )
+                continue
+            is_running = process_datastack(
+                datastack, datastack_info, days_to_expire, merge_tables
+            )
             if not is_running:
                 celery_logger.error(f"Materialization workflow for {datastack} is not running: {is_running}")
         except Exception as e:

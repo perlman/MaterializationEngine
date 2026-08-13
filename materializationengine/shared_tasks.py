@@ -488,9 +488,21 @@ def check_if_task_is_running(task_name: str, worker_name_prefix: str) -> bool:
     inspector = celery.control.inspect()
     active_tasks_dict = inspector.active()
 
+    # inspect().active() returns None when no worker replies to the broadcast
+    # (e.g. the target workers are scaled to zero under KEDA). No live worker
+    # means nothing is running. NOTE: this only reflects tasks a worker is
+    # actively executing -- a task sitting in the broker queue or on a
+    # cold-starting pod is invisible here, so callers that must not race with a
+    # queued task should check the LockedTask redis lock instead.
+    if not active_tasks_dict:
+        return False
+
     workflow_active_tasks = next(
-        v for k, v in active_tasks_dict.items() if worker_name_prefix in k
+        (v for k, v in active_tasks_dict.items() if worker_name_prefix in k),
+        None,
     )
+    if not workflow_active_tasks:
+        return False
 
     for active_task in workflow_active_tasks:
         if task_name in active_task.values():
