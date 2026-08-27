@@ -48,6 +48,13 @@ class BaseConfig:
     MERGE_TABLES = True
     AUTH_SERVICE_NAMESPACE = "datastack"
 
+    # Local dev override: when set, every aligned_volume/version database name
+    # db_manager/dynamic_annotation_cache would otherwise resolve is replaced
+    # with this one instead (e.g. a single consolidated matng test_db standing
+    # in for every real database). Leave unset for anything but local testing
+    # against a single hand-migrated database.
+    DATABASE_NAME_OVERRIDE = None
+
     REDIS_HOST = "localhost"
     REDIS_PORT = 6379
     REDIS_PASSWORD = ""

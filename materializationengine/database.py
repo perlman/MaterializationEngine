@@ -58,7 +58,11 @@ class DatabaseConnectionManager:
         if database_name not in self._engines:
             SQL_URI_CONFIG = current_app.config["SQLALCHEMY_DATABASE_URI"]
             sql_base_uri = SQL_URI_CONFIG.rpartition("/")[0]
-            sql_uri = f"{sql_base_uri}/{database_name}"
+            # Local dev override: a single consolidated database (e.g. matng's
+            # test_db) stands in for every aligned_volume/version database name
+            # that would otherwise be resolved. Unset in all real configs.
+            effective_database_name = current_app.config.get("DATABASE_NAME_OVERRIDE") or database_name
+            sql_uri = f"{sql_base_uri}/{effective_database_name}"
 
             pool_size = current_app.config.get("DB_CONNECTION_POOL_SIZE", 20)
             max_overflow = current_app.config.get("DB_CONNECTION_MAX_OVERFLOW", 30)
@@ -166,8 +170,10 @@ class DynamicMaterializationCache:
         sql_uri_config = get_config_param("SQLALCHEMY_DATABASE_URI")
         pool_size = current_app.config.get("DB_CONNECTION_POOL_SIZE", 20)
         max_overflow = current_app.config.get("DB_CONNECTION_MAX_OVERFLOW", 30)
+        # See DatabaseConnectionManager.get_engine's matching override.
+        effective_database = get_config_param("DATABASE_NAME_OVERRIDE") or database
         mat_client = DynamicAnnotationInterface(
-            sql_uri_config, database, pool_size, max_overflow
+            sql_uri_config, effective_database, pool_size, max_overflow
         )
         self._clients[database] = mat_client
         return self._clients[database]

@@ -8,6 +8,8 @@
 {% block content %}
 <h3> versions </h3>
 {{table|safe}}
-<a href="{{url_for('views.datastack_view',datastack_name=datastack)}}?all=true">show all</a> 
+<a href="{{url_for('views.datastack_view',datastack_name=datastack)}}?all=true">show all</a>
+&nbsp;|&nbsp;
+<a href="{{url_for('views.live_view',datastack_name=datastack)}}">view live data</a>
 
 {% endblock %}

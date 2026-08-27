@@ -36,6 +36,11 @@ from sqlalchemy.sql import text
 from materializationengine.blueprints.client.datastack import validate_datastack
 from materializationengine.blueprints.client.query_manager import QueryManager
 from materializationengine.blueprints.client.schemas import AnalysisViewSchema
+from materializationengine.blueprints.client.versioned_query import (
+    count_versioned_table,
+    is_consolidated_table,
+    query_versioned_table,
+)
 from materializationengine.blueprints.reset_auth import reset_auth
 from materializationengine.celery_init import celery
 from materializationengine.database import db_manager, dynamic_annotation_cache
@@ -186,13 +191,23 @@ def datastack_view(datastack_name):
         )
         show_all = request.args.get("all", False) is not False
         if not show_all:
-            version_query = version_query.filter(AnalysisVersion.valid == True)
+            # NEXT_VERSION is the in-progress accumulation matng's update-data
+            # stamps rows with (see docs/next_version_design.md) -- it never
+            # gets valid=True (that column is untouched by matng), so without
+            # this it silently disappears from the default view.
+            version_query = version_query.filter(
+                or_(AnalysisVersion.valid == True, AnalysisVersion.status == "NEXT_VERSION")
+            )
         versions = version_query.order_by(AnalysisVersion.version.desc()).all()
 
         if len(versions) > 0:
             schema = AnalysisVersionSchema(many=True)
             column_order = schema.declared_fields.keys()
             df = pd.DataFrame(data=schema.dump(versions, many=True))
+
+            # Preserved before any column gets overwritten with link HTML below.
+            next_version_mask = df["status"] == "NEXT_VERSION"
+            raw_versions = df["version"].copy()
 
             df = make_df_with_links_to_id(
                 objects=versions,
@@ -212,6 +227,16 @@ def datastack_view(datastack_name):
                 df=df,
                 datastack_name=datastack_name,
             )
+
+            # NEXT_VERSION has no completed analysistables/snapshot to show via
+            # version_view -- link it at the live/current data instead.
+            if next_version_mask.any():
+                df.loc[next_version_mask, "version"] = raw_versions[next_version_mask].apply(
+                    lambda v: "<a href='{}'>{} (live)</a>".format(
+                        url_for("views.live_view", datastack_name=datastack_name), v
+                    )
+                )
+
             df = df.reindex(columns=column_order)
 
             classes = ["table table-borderless"]
@@ -394,19 +419,27 @@ def version_view(
         column_order = AnalysisTableSchema().declared_fields.keys()
         tables_html = dataframe_to_html(tables_df, column_order)
 
-    # Handle materialized views in separate session
-    with db_manager.session_scope(f"{datastack_name}__mat{version}") as mat_session:
-        views_df = create_views_dataframe(
-            mat_session, 
-            target_datastack, 
-            target_version, 
-            current_app.config["GLOBAL_SERVER_URL"]
-        )
-        
-        if len(views_df) > 0:
-            views_html = dataframe_to_html(views_df)
-        else:
-            views_html = "<h4>No views in datastack</h4>"
+    # Handle materialized views in separate session. Per-version-database
+    # deployments keep views in a dedicated "{datastack}__mat{version}"
+    # database; a consolidated (matng-migrated) deployment has no such
+    # database/table, so this is best-effort -- fall back to a plain message
+    # rather than 500ing the whole page.
+    try:
+        with db_manager.session_scope(f"{datastack_name}__mat{version}") as mat_session:
+            views_df = create_views_dataframe(
+                mat_session,
+                target_datastack,
+                target_version,
+                current_app.config["GLOBAL_SERVER_URL"]
+            )
+
+            if len(views_df) > 0:
+                views_html = dataframe_to_html(views_df)
+            else:
+                views_html = "<h4>No views in datastack</h4>"
+    except Exception as e:
+        current_app.logger.info(f"No per-version views database for {datastack_name} v{version}: {e}")
+        views_html = "<h4>No views in datastack</h4>"
 
     return render_template(
         "version.html",
@@ -416,7 +449,63 @@ def version_view(
         view_table=views_html,
         version=__version__,
     )
-      
+
+
+@views_bp.route("/datastack/<datastack_name>/live")
+@auth_requires_permission("view", table_arg="datastack_name")
+def live_view(datastack_name):
+    """Current/live state of a consolidated (matng-migrated) datastack --
+    the data still accumulating under NEXT_VERSION -- read directly via
+    versioned_query.py rather than a frozen analysistables snapshot. Unlike
+    version_view, there's no single analysisversion_id to enumerate tables
+    from here (a live table may not have been rescanned by update-data
+    recently), so tables are discovered the same way matng's own
+    migrate_data.py does: annotation_table_metadata rows still valid.
+    """
+    aligned_volume_name, pcg_table_name = get_relevant_datastack_info(datastack_name)
+    db = dynamic_annotation_cache.get_db(aligned_volume_name)
+
+    with db_manager.session_scope(aligned_volume_name) as session:
+        tables = session.execute(
+            text(
+                "SELECT table_name, schema_type FROM annotation_table_metadata "
+                "WHERE valid = TRUE AND deleted IS NULL ORDER BY table_name;"
+            )
+        ).fetchall()
+
+    sections = []
+    for table_name, schema_type in tables:
+        try:
+            row_count = count_versioned_table(db, table_name, schema_type, pcg_table_name)
+            preview_df = query_versioned_table(
+                db, table_name, schema_type, pcg_table_name, limit=10,
+            )
+        except Exception as e:
+            # Listed in annotation_table_metadata but never migrated by matng
+            # (no "{table_name}__{pcg_table_name}" table exists), or some
+            # other per-table read failure -- skip it rather than failing the
+            # whole page. Must roll back before the next table: a failed
+            # query leaves db.database.session's shared connection in an
+            # aborted-transaction state, which would otherwise cascade and
+            # fail every subsequent table too, even valid ones.
+            current_app.logger.warning(f"Skipping {table_name} in live view for {datastack_name}: {e}")
+            db.database.session.rollback()
+            continue
+
+        sections.append(
+            f"<h4>{table_name} &mdash; {row_count} live row(s), showing up to 10</h4>"
+            + dataframe_to_html(preview_df)
+        )
+
+    tables_html = "".join(sections) if sections else "<h4>No migrated tables found</h4>"
+
+    return render_template(
+        "live.html",
+        datastack=datastack_name,
+        table=tables_html,
+        version=__version__,
+    )
+
 
 @views_bp.route("/datastack/<datastack_name>/table/<int:id>")
 @auth_requires_permission("view", table_arg="datastack_name")
@@ -431,7 +520,17 @@ def table_view(datastack_name, id: int):
 
     with request_db_session(aligned_volume_name) as db:
         check_read_permission(db, table_name)
-   
+
+        # generic_report assumes a production per-version-database deployment
+        # (a "{datastack}__mat{version}" database with a materializedmetadata
+        # table); a consolidated (matng-migrated) deployment has neither, so
+        # route those to consolidated_report instead, which reads via
+        # versioned_query.py against the single consolidated database.
+        if is_consolidated_table(db, table_name, pcg_table_name):
+            return redirect(
+                url_for("views.consolidated_report", datastack_name=datastack_name, id=id)
+            )
+
     # mapping = {
     #     "synapse": url_for(
     #         "views.synapse_report", id=id, datastack_name=datastack_name
@@ -445,6 +544,67 @@ def table_view(datastack_name, id: int):
     # else:
     return redirect(
         url_for("views.generic_report", datastack_name=datastack_name, id=id)
+    )
+
+
+@views_bp.route("/datastack/<datastack_name>/table/<int:id>/consolidated")
+@auth_requires_permission("view", table_arg="datastack_name")
+def consolidated_report(datastack_name, id):
+    """Sample-rows report for a table on the consolidated (matng-migrated)
+    schema, as of the specific frozen version the link was generated for.
+    Reads via versioned_query.py rather than QueryManager -- generic_report's
+    approach depends on per-version-database bookkeeping (materializedmetadata)
+    that doesn't exist here, and QueryManager's join (annmodel.id == segmodel.id)
+    assumes the plain 1:1 segmentation table shape, not this schema's
+    anno_id/id restructuring."""
+    aligned_volume_name, pcg_table_name = get_relevant_datastack_info(datastack_name)
+
+    with db_manager.session_scope(aligned_volume_name) as session:
+        table = session.query(AnalysisTable).filter(AnalysisTable.id == id).first()
+        if table is None:
+            abort(404, "this table does not exist")
+        table_name = table.table_name
+        schema_type = table.schema
+        version = table.analysisversion.version
+
+    db = dynamic_annotation_cache.get_db(aligned_volume_name)
+    try:
+        row_count = count_versioned_table(db, table_name, schema_type, pcg_table_name, version=version)
+        preview_df = query_versioned_table(
+            db, table_name, schema_type, pcg_table_name, version=version, limit=100,
+        )
+    except Exception as e:
+        # The segmentation table has valid_to_version (is_consolidated_table said
+        # yes), but the read still failed -- most commonly the plain annotation
+        # table was never migrated for this one (e.g. matng's migrate ran with
+        # --skip-annotation for it while other tables got both sides). Roll back
+        # so this request's session isn't left in an aborted-transaction state,
+        # and show a clear message instead of a raw 500.
+        db.database.session.rollback()
+        current_app.logger.warning(
+            f"consolidated_report failed for {table_name} v{version} in {datastack_name}: {e}"
+        )
+        return render_template(
+            "sample.html",
+            datastack=datastack_name,
+            table_name=table_name,
+            analysisversion=version,
+            n_annotations="unavailable",
+            table=f"<p>Could not read this table: {e}</p>"
+                  f"<p>Likely cause: the plain '{table_name}' annotation table was never "
+                  "migrated (only its segmentation counterpart), e.g. matng's migrate ran "
+                  "with --skip-annotation for this table.</p>",
+            version=__version__,
+        )
+
+    return render_template(
+        "sample.html",
+        datastack=datastack_name,
+        table_name=table_name,
+        analysisversion=version,
+        n_annotations=row_count,
+        table=dataframe_to_html(preview_df),
+        version=__version__,
     )
 
 

@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+
+{% block header %}
+<h1 class="datastack_header">{% block title %}{{datastack}} (live){% endblock %}</h1>
+{% endblock %}
+
+{% block content %}
+<p>Current/live data -- rows not yet superseded, still accumulating under NEXT_VERSION.</p>
+{{table|safe}}
+{% endblock %}

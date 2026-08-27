@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+
+{% block header %}
+<h1 class="datastack_header">{% block title %}{{datastack}} {{table_name}}{% endblock %}</h1>
+{% endblock %}
+
+{% block content %}
+<p>version {{analysisversion}} &mdash; # annotations: {{n_annotations}}</p>
+{{table|safe}}
+{% endblock %}

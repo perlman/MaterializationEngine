@@ -14,7 +14,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.selectable import Alias
 from sqlalchemy.sql.schema import Table
 from sqlalchemy.sql.expression import tablesample
-from sqlalchemy.ext.declarative.api import DeclarativeMeta
+from sqlalchemy.orm import DeclarativeMeta
 import datetime
 
 from materializationengine.blueprints.client.cache import get_cached_table_metadata, get_cached_view_metadata

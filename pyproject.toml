@@ -85,6 +85,12 @@ profile = [
 [tool.uv]
 default-groups = ["dev", "docs", "lint", "profile"]
 
+[tool.uv.sources]
+# Local dev only: pick up in-progress edits to these sibling repos (matches
+# matng's own pyproject.toml convention) instead of the pinned PyPI releases.
+dynamicannotationdb = { path = "../DynamicAnnotationDB", editable = true }
+emannotationschemas = { path = "../EMAnnotationSchemas", editable = true }
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
